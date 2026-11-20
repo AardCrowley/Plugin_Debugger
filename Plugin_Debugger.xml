@@ -1,0 +1,834 @@
+<?xml version="1.0" encoding="iso-8859-1"?>
+<!DOCTYPE muclient>
+<muclient>
+<plugin
+   name="Plugin_Debugger"
+   author="Crowley"
+   id="11c5afa4971179c017400c76"
+   language="Lua"
+   purpose="A cleaner Trace: what fires, who called it, and what line led to a command being sent"
+   save_state="y"
+   date_written="2026-11-12 12:00:00"
+   requires="4.90"
+   version="0.92"
+   sequence="-1000"
+   >
+<description trim="y">
+<![CDATA[
+Plugin Debugger: reads the Trace output (no changes needed in any plugin) and prints a cleaned-up version in the world window.
+
+  dbg on / dbg off         start / stop (this switches MUSHclient's trace on and off for you)
+  dbg help                 the commands, with examples, in the world window
+  dbg options              the current settings
+  dbg window               a window: tick the plugins and the kinds of line you want to watch
+
+  Short version: dbg watch triggers aliases     only those types
+                 dbg watch MyPlugin             only that plugin
+                 dbg watch stock                only the Aardwolf package's own plugins
+                 dbg ignore calls callbacks     hide whole types
+                 dbg summary                    who called what, how often, last 10 seconds
+                 dbg log on                     keep a file of what is watched
+
+Every command sent to the world (typed, from an alias, a trigger or a script) is shown as SENT "text" together with what came right
+before it: the trigger or alias lines from the trace and the last line the game sent. "I never typed stop, why is it sent?" ends up
+as SENT "stop" <- the line that matched.
+Repeated lines in a burst are collapsed into "x12".
+
+Every line starts with [dbg] and a coloured [type] tag: [trigger] [alias] [timer] [call] [callback] [broadcast] [script] [sent] [other]
+(the same words dbg watch and dbg ignore use). What they mean:
+  call      one plugin calling a function in another one with CallPlugin:  caller -> plugin: function(arguments)
+  callback  a function MUSHclient itself runs in a plugin when something happens in the client (names that start with On:
+            OnPluginLineReceived for every line, OnPluginBroadcast, OnPluginSent, OnPluginPacketReceived ...)
+  trigger / alias / timer  a match, shown with the script it ran:  plugin: trigger "pattern"  ->  script("the line")
+  broadcast a plugin announcing something to all the others with BroadcastPlugin (GMCP data, "dock_ready" ...); the plugins that listen
+            then show up as callbacks (OnPluginBroadcast)
+  script    a script function run by something the debugger did not see the start of
+  sent      a command sent to the world; the "before" lines under it are the matches that led to it
+
+]]>
+</description>
+</plugin>
+
+<aliases>
+  <alias match="^dbg(?:\s+(.*))?$" enabled="y" regexp="y" script="dbg_command" sequence="100" ignore_case="y"/>
+</aliases>
+
+<script>
+<![CDATA[
+local on, quiet, logging = false, false, false
+local watch, ignore, types, itypes, groups, igroups = {}, {}, {}, {}, {}, {}
+local ring, RING_MAX = {}, 3000
+local queue, flushing = {}, false
+local recent = {}                      -- the last trace lines that are not plain function calls (trigger/alias matches, sends ...)
+local lastLine = nil                   -- the last line the game sent: { text, t }
+local got, lastShown = 0, nil
+local logfile
+local pick = nil                   -- plugins ticked in the options window: nil = every plugin, else a set of lower case names ("(world)" = the world's own scripts)
+
+local NOISE = { "windowtext", "windowrectop", "windowline", "windowshow", "windowposition", "windowcreate", "windowcircleop", "windowgradient",
+                "windowfont", "windowinfo", "windowhotspot", "windowaddhotspot", "windowmovehotspot", "redraw", "bufferedrepaint", "windowdelete" }
+
+local function say(s) ColourNote("silver", "", "[dbg] " .. s) end
+local function now() return os.time() end
+
+function OnPluginSaveState()
+  SetVariable("watch", table.concat(watch, ","))
+  SetVariable("ignore", table.concat(ignore, ","))
+  SetVariable("types", table.concat(types, ","))
+  SetVariable("itypes", table.concat(itypes, ","))
+  SetVariable("groups", table.concat(groups, ","))
+  SetVariable("igroups", table.concat(igroups, ","))
+  local pl = {}
+  for k in pairs(pick or {}) do pl[#pl + 1] = k end
+  table.sort(pl)
+  SetVariable("pick", table.concat(pl, "\t")); SetVariable("picked", pick and "1" or "0")
+  SetVariable("logging", logging and "1" or "0")
+  SetVariable("quiet", quiet and "1" or "0")
+end
+local function loadList(name)
+  local t = {}
+  for w in (GetVariable(name) or ""):gmatch("[^,]+") do t[#t + 1] = w end
+  return t
+end
+
+local noiseOn = {}                     -- noise words let through for now (never saved: every load starts with them hidden)
+local function isNoise(l)
+  l = l:lower()
+  for _, w in ipairs(NOISE) do if l:find(w, 1, true) and not noiseOn[w] then return true end end
+  return false
+end
+local TYPE_WORDS = { trigger = "trigger", triggers = "trigger", alias = "alias", aliases = "alias", timer = "timer", timers = "timer",
+                    call = "call", calls = "call", callback = "callback", callbacks = "callback", script = "script", scripts = "script",
+                    broadcast = "broadcast", broadcasts = "broadcast", sent = "sent", other = "other", others = "other" }
+local function typeSet() local t = {}; for _, w in ipairs(types) do t[w] = true end; return t end
+-- "stock" = the plugins the Aardwolf package's world file (Aardwolf.mcl) includes. They are matched by file name, wherever the file sits.
+local STOCK_FILES = {}
+for f in ([[aard_requirements.xml aard_text_substitution.xml aard_prompt_fixer.xml aard_chat_echo.xml aard_channels_fiendish.xml
+  aard_soundpack.xml aard_GMCP_handler.xml aard_miniwindow_z_order_monitor.xml aard_layout.xml aard_statmon_gmcp.xml
+  aard_group_monitor_gmcp.xml aard_health_bars_gmcp.xml aard_Copy_Colour_Codes.xml aard_ASCII_map.xml aard_repaint_buffer.xml
+  aard_new_connection.xml aard_inventory_serials.xml Hyperlink_URL2.xml aard_GMCP_mapper.xml aard_package_update_checker.xml
+  aard_help.xml aard_keyboard_lockout.xml aard_splitscreen_scrollback.xml aard_vital_shortcuts.xml aard_Theme_Controller.xml
+  aard_ingame_help_window.xml Automatic_Backup.xml]]):gmatch("%S+") do STOCK_FILES[f:lower()] = true end
+local GROUP_WORDS = { stock = "stock", thirdparty = "thirdparty", ["third-party"] = "thirdparty", ["3rdparty"] = "thirdparty" }
+local stockCache = nil
+local function fileOf(id) return ((GetPluginInfo(id, 6) or ""):match("[^/\\]+$") or ""):lower() end
+local function buildStock()
+  stockCache = {}
+  for _, id in ipairs(GetPluginList() or {}) do
+    local name = GetPluginInfo(id, 1)
+    if name then stockCache[name] = STOCK_FILES[fileOf(id)] == true end
+  end
+end
+local function isStock(name)
+  if not stockCache or stockCache[name] == nil then buildStock() end
+  return stockCache[name] == true
+end
+local function inGroups(list, ...)
+  for _, plugin in ipairs({ ... }) do
+    if plugin and plugin ~= "" then
+      local st = isStock(plugin)
+      for _, g in ipairs(list) do
+        if (g == "stock" and st) or (g == "thirdparty" and not st) then return true end
+      end
+    end
+  end
+  return false
+end
+
+local function pickHas(...)
+  for _, p in ipairs({ ... }) do
+    if p and p ~= "" and pick[p:lower()] then return true end
+  end
+  return false
+end
+
+local function wanted(text, kind, plugin, from)
+  local l = text:lower()
+  for _, w in ipairs(itypes) do if w == kind then return false end end
+  for _, w in ipairs(ignore) do if l:find(w, 1, true) then return false end end
+  if #igroups > 0 and inGroups(igroups, plugin, from) then return false end
+  if #types > 0 then
+    local ok = false
+    for _, w in ipairs(types) do if w == kind then ok = true end end
+    if not ok then return false end
+  end
+  if #watch == 0 and #groups == 0 and not pick then return true end
+  for _, w in ipairs(watch) do if l:find(w, 1, true) then return true end end
+  if #groups > 0 and inGroups(groups, plugin, from) then return true end
+  if pick then
+    if kind == "sent" or pickHas(plugin, from) then return true end            -- a sent command is chosen with the types, not with the plugins
+    if (not plugin or plugin == "") and #watch == 0 and pick["(world)"] then return true end
+    return false
+  end
+  if #watch == 0 and (not plugin or plugin == "") then return true end       -- lines that belong to no plugin (sent commands ...) pass a group-only filter
+  return false
+end
+
+local function depthOf(msg, marker)
+  local pre = msg:match("^(.-)" .. marker) or ""
+  return math.floor(math.max(0, #(pre:match("(%s*)$") or "") - 1) / 2)
+end
+local function tidyArgs(a)
+  a = a:gsub(", <table>", ""):gsub('^"%*[%w_]+", ', "")
+  return a
+end
+local function parse(msg)
+  local plug, fn, from = msg:match('Plugin "(.-)": Function: (.-) %[CallPlugin from "(.-)"%]')
+  if plug then
+    local depth = depthOf(msg, 'Plugin "')
+    return { kind = "call", plugin = plug, fn = fn, from = from, depth = depth,
+             s = string.rep("  ", depth) .. from .. " -> " .. plug .. ": " .. fn,
+             key = from .. " -> " .. plug .. "." .. (fn:match("^[^(]+") or fn) }
+  end
+  local bplug, bargs = msg:match('Plugin "(.-)": BroadcastPlugin%((.*)%)')
+  if bplug then
+    local depth = depthOf(msg, 'Plugin "')
+    return { kind = "broadcast", plugin = bplug, depth = depth, s = string.rep("  ", depth) .. bplug .. ": BroadcastPlugin(" .. bargs .. ")",
+             key = bplug .. " broadcast " .. (bargs:match("^[^,]*") or "") }
+  end
+  plug, fn = msg:match('Plugin "(.-)": Function: (.+)$')
+  if plug then
+    local depth = depthOf(msg, 'Plugin "')
+    local name = fn:match("^[^(]+") or fn
+    local kind = name:match("^On%u") and "callback" or "script"
+    return { kind = kind, plugin = plug, fn = fn, depth = depth, s = string.rep("  ", depth) .. plug .. ": " .. fn,
+             key = plug .. "." .. name }
+  end
+  if not msg:find('Plugin "', 1, true) then                                  -- the world's own (not a plugin's) scripts: "Function: retreat(...)"
+    fn = msg:match("Function: (.+)$")
+    if fn then
+      local depth = depthOf(msg, "Function:")
+      local name = fn:match("^[^(]+") or fn
+      return { kind = name:match("^On%u") and "callback" or "script", plugin = "", fn = fn, depth = depth, s = string.rep("  ", depth) .. "world: " .. fn, key = "world." .. name }
+    end
+  end
+  local what, label
+  plug, what, label = msg:match('Plugin "(.-)": Matched (%a+) (.+)$')
+  if not plug then what, label = msg:match("Matched (%a+) (.+)$") end
+  if what and (what:lower() == "trigger" or what:lower() == "alias" or what:lower() == "timer") then
+    what = what:lower()
+    return { kind = what, plugin = plug or "", match = true, label = label,
+             s = (plug and (plug .. ": ") or "") .. what .. " " .. label, key = (plug or "world") .. " " .. what .. " " .. label:sub(1, 50) }
+  end
+  plug, label = msg:match('Plugin "(.-)": Fired (.+)$')
+  if not plug then label = msg:match("^%s*.-Fired (.+timer.+)$") end
+  if label then
+    label = label:gsub("^unlabelled timer ", "(unlabelled) "):gsub("^timer ", "")
+    return { kind = "timer", plugin = plug or "", match = true, label = label, s = (plug and (plug .. ": ") or "") .. "timer " .. label,
+             key = (plug or "world") .. " timer " .. label:sub(1, 40) }
+  end
+  local text = msg:gsub("^%s+", ""):gsub("%s+$", "")
+  return { kind = "other", s = text, key = text:sub(1, 60) }
+end
+
+local LOG_MAX = 5 * 1024 * 1024        -- when the log reaches this size it becomes plugin_debugger.old.log (one old copy is kept)
+local logSize = 0
+local function logLine(s)
+  if not logging then return end
+  local path = (GetInfo(66) or "") .. "plugin_debugger.log"
+  if not logfile then
+    logfile = io.open(path, "a")
+    if logfile then logSize = logfile:seek("end") or 0 end
+  end
+  if not logfile then return end
+  local line = os.date("%Y-%m-%d %H:%M:%S ") .. s .. "\n"
+  logfile:write(line); logfile:flush(); logSize = logSize + #line
+  if logSize > LOG_MAX then
+    logfile:close(); logfile = nil; logSize = 0
+    local old = (GetInfo(66) or "") .. "plugin_debugger.old.log"
+    os.remove(old); os.rename(path, old)
+  end
+end
+
+-- every line starts with [dbg] and a coloured [type] tag, the same words "dbg watch" and "dbg ignore" understand
+local TAG = { trigger = "lime", alias = "deepskyblue", timer = "violet", call = "cyan", callback = "gray", broadcast = "gold", script = "mediumseagreen",
+              sent = "yellow", other = "orange", ctx = "gray" }
+local TAGNAME = { ctx = "before" }
+local function flush()
+  flushing = false
+  local i = 1
+  while i <= #queue do
+    local q, n = queue[i], 1
+    while queue[i + n] and queue[i + n].s == q.s do n = n + 1 end
+    local body = q.s .. (n > 1 and ("  x" .. n) or "")
+    local colour = TAG[q.kind] or "silver"
+    ColourNote("gray", "", "[dbg] ", colour, "", "[" .. (TAGNAME[q.kind] or q.kind) .. "] ", q.kind == "sent" and "yellow" or "silver", "", body)
+    i = i + n
+  end
+  queue = {}
+end
+local function show(kind, s)
+  queue[#queue + 1] = { kind = kind, s = s }
+  if not flushing then flushing = true; DoAfterSpecial(0.4, "dbg_flush()", 12) end
+end
+function dbg_flush() flush() end
+
+local function addRing(ev)
+  ring[#ring + 1] = ev
+  if #ring > RING_MAX then table.remove(ring, 1) end
+end
+
+local pend = nil                    -- a trigger/alias/timer match waiting for the script it ran
+local function commit(ev)
+  ev.t = ev.t or now()
+  addRing(ev)
+  if ev.kind ~= "call" and ev.kind ~= "callback" then
+    recent[#recent + 1] = ev
+    if #recent > 12 then table.remove(recent, 1) end
+  end
+  if wanted(ev.s, ev.kind, ev.plugin, ev.from) then show(ev.kind, ev.s); logLine(ev.s) end        -- the log follows the same watch / ignore rules as the screen
+end
+local function flushPend()
+  if pend then local p = pend; pend = nil; commit(p) end
+end
+local function event(ev)
+  if pend then
+    if ev.kind == "script" and ev.plugin == pend.plugin then            -- the script that match ran: one line for both
+      local p = pend; pend = nil
+      local name = ev.fn:match("^[^(]+") or ev.fn
+      local args = ev.fn:match("%((.*)%)$") or ""
+      p.s = p.s .. "  ->  " .. name .. "(" .. tidyArgs(args) .. ")"
+      p.key = p.key
+      commit(p)
+      return
+    end
+    flushPend()
+  end
+  if ev.match then pend = ev; DoAfterSpecial(0.3, "dbg_flushpend()", 12); return end
+  commit(ev)
+end
+function dbg_flushpend() flushPend() end
+
+-- plugin callbacks -------------------------------------------------------------------------
+function OnPluginTrace(msg)
+  if not on then return end
+  got = got + 1
+  if type(msg) ~= "string" or msg == "" or msg:find("Trace off", 1, true) or msg:find("Trace on", 1, true) then return end
+  if isNoise(msg) then return end
+  event(parse(msg))
+  if quiet then return false end
+end
+
+function OnPluginLineReceived(text)
+  if on then lastLine = { text = text, t = now() } end
+  return true
+end
+
+function OnPluginSent(text)
+  if not on or not text then return end
+  flushPend()
+  local line = text:gsub("[\r\n]+$", "")
+  if not wanted(line, "sent") then return end
+  local t = now()
+  local ev = { kind = "sent", t = t, s = 'SENT "' .. line .. '"', key = "sent" }
+  addRing(ev)
+  show("sent", ev.s); logLine(ev.s)
+  local first = math.max(1, #recent - 4)                            -- the last few matches, at most
+  for i = first, #recent do local r = recent[i]; if t - r.t <= 1 then show("ctx", r.s) end end
+  if lastLine and t - lastLine.t <= 1 then show("ctx", 'last line from the game: "' .. lastLine.text:sub(1, 120) .. '"') end
+end
+
+-- command ------------------------------------------------------------------------------
+local function listHas(t, w) for i, v in ipairs(t) do if v == w then return i end end end
+
+local function startTrace()
+  on = true; got = 0
+  SetTrace(true)
+  say("on. Trace lines are read here" .. (quiet and " and kept out of the Trace window." or "."))
+end
+local function stopTrace()
+  flush(); on = false
+  SetTrace(false)
+  say("off.")
+end
+
+local function summary(secs)
+  flushPend()
+  local limit, counts, order = now() - secs, {}, {}
+  for _, ev in ipairs(ring) do
+    if ev.t >= limit and ev.kind ~= "sent" then
+      if not counts[ev.key] then counts[ev.key] = 0; order[#order + 1] = ev.key end
+      counts[ev.key] = counts[ev.key] + 1
+    end
+  end
+  table.sort(order, function(a, b) return counts[a] > counts[b] end)
+  if #order == 0 then say("Nothing in the last " .. secs .. " seconds.") return end
+  say("last " .. secs .. " seconds:")
+  for i = 1, math.min(15, #order) do
+    ColourNote("silver", "", string.format("  %5d  (%.1f/s)  %s", counts[order[i]], counts[order[i]] / secs, order[i]))
+  end
+end
+
+local function typesText() return #types == 0 and "every type" or (types[1] == "none" and "no type" or table.concat(types, ", ")) end
+local function whereText()
+  local w = {}
+  if pick then
+    local n = 0
+    for _ in pairs(pick) do n = n + 1 end
+    w[#w + 1] = n == 0 and "no plugin picked" or (n .. " picked plugin" .. (n == 1 and "" or "s") .. " (dbg window)")
+  end
+  for _, g in ipairs(groups) do w[#w + 1] = (g == "stock" and "stock plugins" or "third-party plugins") end
+  for _, x in ipairs(watch) do w[#w + 1] = x end
+  return #w > 0 and table.concat(w, ", ") or "every plugin"
+end
+local function watchText() return "watching " .. typesText() .. " in " .. whereText() .. "." end
+local function ignoreText()
+  local all = {}
+  for _, w in ipairs(itypes) do all[#all + 1] = w .. " (type)" end
+  for _, g in ipairs(igroups) do all[#all + 1] = (g == "stock" and "stock plugins" or "third-party plugins") end
+  for _, w in ipairs(ignore) do all[#all + 1] = w end
+  return "ignoring: " .. (#all > 0 and table.concat(all, ", ") or "(nothing)") .. "."
+end
+
+local function row(cmd, desc) ColourNote("cyan", "", string.format("  %-36s", cmd), "silver", "", desc) end
+local function head(t) ColourNote("white", "", t) end
+local function plain(t) ColourNote("silver", "", "  " .. t) end
+
+function dbg_help()
+  head("Plugin Debugger: shows what fires in your plugins, without changing them")
+  head("Start and stop")
+  row("dbg on / dbg off", "start or stop (this turns MUSHclient's trace on and off too)")
+  row("dbg options", "show the current settings")
+  head("Choose what you see")
+  row("dbg window", "a window with a box for every plugin and every kind of line (All / None buttons for each)")
+  row("dbg watch triggers aliases", "show only those types (in every plugin)")
+  row("dbg watch GMCP_handler", "show only lines from that plugin (any type)")
+  row("dbg watch GMCP_handler triggers", "that plugin, those types: plugin names and types mix freely")
+  row("dbg watch stock", "only the plugins that come with the Aardwolf package (good for client bugs; the list is the package's world file)")
+  row("dbg watch thirdparty", "only your own and other add-on plugins. 'dbg stock' lists which ones count as stock")
+  row("dbg watch all   /   dbg watch clear", "show everything again")
+  row("dbg ignore calls callbacks", "hide whole types")
+  row("dbg ignore stock", "hide a whole group (stock or thirdparty)")
+  row("dbg ignore gmcpdata", "hide any line containing that text")
+  row("dbg noise windowrectop", "let one kind of hidden window-drawing line through (dbg noise all for every kind, dbg noise off to hide them again; not remembered)")
+  row("dbg unwatch WORD / dbg unignore WORD", "take one word back out; dbg ignore clear removes all ignores")
+  head("Look back")
+  row("dbg summary [seconds]", "who called what, and how often (default: the last 10 seconds). Finds runaway calls")
+  row("dbg last [number]", "the last events, even ones the live view did not show (default 30)")
+  head("Record")
+  row("dbg log on / dbg log off", "write what you are watching to plugin_debugger.log (in the logs folder, 5 MB then rolls over)")
+  row("dbg quiet on / dbg quiet off", "keep trace lines out of the Trace window while this runs")
+  head("The tags in front of each line")
+  local list = {
+    { "trigger", "a trigger matched; shown with the script it ran" },
+    { "alias", "an alias matched; shown with its script" },
+    { "timer", "a timer fired; shown with its script" },
+    { "call", "one plugin called a function in another (CallPlugin)" },
+    { "callback", "MUSHclient ran a plugin function (OnPluginLineReceived, OnPluginSent ...)" },
+    { "broadcast", "a plugin announced something to all the others (BroadcastPlugin)" },
+    { "script", "a script function whose trigger/alias/timer line was not seen" },
+    { "sent", "a command was sent to the game, with the matches just before it" },
+    { "other", "anything else" },
+  }
+  for _, t in ipairs(list) do ColourNote(TAG[t[1]], "", string.format("  %-12s", "[" .. t[1] .. "]"), "silver", "", t[2]) end
+  plain("Use the type names (plural works: triggers, calls ...) and the group names (stock, thirdparty) with watch and ignore.")
+end
+
+function dbg_options()
+  local function line(label, value, colour) ColourNote("silver", "", string.format("  %-18s", label), colour or "white", "", value) end
+  head("Plugin Debugger options")
+  line("Debugger", on and "ON" or "off", on and "lime" or "gray")
+  line("Trace lines seen", tostring(got) .. (on and got == 0 and "  (none yet: check that nothing else is taking them)" or ""))
+  line("Watching", typesText() .. "  in  " .. whereText())
+  local ign = {}
+  for _, w in ipairs(itypes) do ign[#ign + 1] = w end
+  for _, g in ipairs(igroups) do ign[#ign + 1] = (g == "stock" and "stock plugins" or "third-party plugins") end
+  for _, w in ipairs(ignore) do ign[#ign + 1] = '"' .. w .. '"' end
+  line("Ignoring", #ign > 0 and table.concat(ign, ", ") or "nothing")
+  line("Log file", logging and "ON  (plugin_debugger.log in the logs folder, only what is watched)" or "off", logging and "lime" or "gray")
+  line("Quiet", quiet and "ON  (trace lines are kept out of the Trace window)" or "off", quiet and "lime" or "gray")
+  local nz = {}
+  for _, w in ipairs(NOISE) do if noiseOn[w] then nz[#nz + 1] = w end end
+  line("Noise let through", #nz > 0 and table.concat(nz, ", ") or "none  (window drawing lines are hidden; dbg noise WORD shows one)", #nz > 0 and "orange" or nil)
+  line("Events kept", tostring(#ring) .. "  (see them with dbg last or dbg summary)")
+  plain("Change them with:  dbg window (tick boxes)  /  dbg watch / dbg ignore / dbg log / dbg quiet     (dbg help lists everything)")
+end
+
+-- the options window: a box for every plugin and every kind of line --------------------------------------
+-- It edits the same settings as dbg watch: the plugin boxes become the "pick" set, the kind boxes the "types" list.
+DbgTest = {}
+local ok_theme = pcall(require, "themed_miniwindows")
+local ok_sb = pcall(require, "scrollbar")                  -- the package's scroll bar
+local WIN = "PluginDebuggerOptions"
+local WORLD = "(world)"
+local W = { top = 0, added = {}, names = {}, sb = nil, win = nil,
+            KINDS = { "trigger", "alias", "timer", "call", "callback", "broadcast", "script", "sent", "other" },
+            DESC = { trigger = "a trigger matched", alias = "an alias matched", timer = "a timer fired", call = "one plugin called another",
+                     callback = "the client ran a plugin function", broadcast = "a plugin announced something to all",
+                     script = "a script function ran", sent = "a command was sent to the game", other = "anything else" } }
+DbgTest.W = W
+
+function W.palette()
+  local bg, tt = Theme.PRIMARY_BODY, Theme.BODY_TEXT
+  local function sp(c) return c % 256, math.floor(c / 256) % 256, math.floor(c / 65536) % 256 end
+  local function rgb(r, g, b) return r + g * 256 + b * 65536 end
+  local function mix(c1, c2, t)
+    local r1, g1, b1 = sp(c1); local r2, g2, b2 = sp(c2)
+    return rgb(math.floor(r1 + (r2 - r1) * t), math.floor(g1 + (g2 - g1) * t), math.floor(b1 + (b2 - b1) * t))
+  end
+  local function lum(c) local r, g, b = sp(c); return 0.299 * r + 0.587 * g + 0.114 * b end
+  local tx = mix(tt, lum(tt) >= lum(bg) and rgb(255, 255, 255) or rgb(0, 0, 0), 0.3)
+  return { bg = bg, text = tx, muted = mix(tx, bg, 0.25), panel = mix(bg, tx, 0.09), edge = mix(bg, tx, 0.24),
+           sel = mix(bg, rgb(70, 130, 230), 0.35), idle = rgb(90, 150, 240), on = rgb(70, 190, 105), warn = rgb(235, 165, 60) }
+end
+
+function W.list()                                          -- "(world)" first, then every loaded plugin by name
+  local names, seen = {}, {}
+  for _, id in ipairs(GetPluginList() or {}) do
+    local n = GetPluginInfo(id, 1)
+    if n and n ~= "" and not seen[n:lower()] then seen[n:lower()] = true; names[#names + 1] = n end
+  end
+  table.sort(names, function(a, b) return a:lower() < b:lower() end)
+  table.insert(names, 1, WORLD)
+  return names
+end
+
+function W.shown(name)                                     -- would a line of this plugin be shown by the rules as they are now?
+  local l = name:lower()
+  if pick then return pick[l] == true end
+  if name == WORLD then return #watch == 0 end
+  if #watch == 0 and #groups == 0 then return true end
+  for _, w in ipairs(watch) do if l:find(w, 1, true) then return true end end
+  return #groups > 0 and inGroups(groups, name)
+end
+function W.kind_shown(k) return #types == 0 or listHas(types, k) ~= nil end
+
+local function clear(t) for i = #t, 1, -1 do t[i] = nil end end
+
+function W.toggle_plugin(name)
+  local names = W.list()
+  if not pick then                                         -- rules typed as commands become a plain selection first (what the list shows)
+    local p = {}
+    for _, n in ipairs(names) do if W.shown(n) then p[n:lower()] = true end end
+    pick = p
+    clear(watch); clear(groups)
+  end
+  local l = name:lower()
+  if pick[l] then pick[l] = nil else pick[l] = true end
+  for _, n in ipairs(names) do if not pick[n:lower()] then return end end
+  pick = nil                                               -- everything ticked: back to "every plugin", so a plugin loaded later is watched too
+end
+
+function W.toggle_kind(k)
+  local cur = {}
+  for _, x in ipairs(#types == 0 and W.KINDS or types) do cur[x] = true end
+  cur.none = nil
+  if cur[k] then cur[k] = nil else cur[k] = true end
+  clear(types)
+  local n = 0
+  for _, x in ipairs(W.KINDS) do if cur[x] then types[#types + 1] = x; n = n + 1 end end
+  if n == #W.KINDS then clear(types) elseif n == 0 then types[1] = "none" end
+end
+
+function W.repaint()
+  if BufferedRepaint then BufferedRepaint()
+  elseif IsPluginInstalled("abc1a0944ae4af7586ce88dc") then CallPlugin("abc1a0944ae4af7586ce88dc", "BufferedRepaint")
+  else Redraw() end
+end
+
+function W.draw()
+  local win = W.win
+  if not win or not win.bodyleft then return end
+  local fname, fsize = GetAlphaOption("output_font_name"), GetOption("output_font_height")
+  WindowFont(WIN, "dw_f", fname, fsize, false); WindowFont(WIN, "dw_fb", fname, fsize, true); WindowFont(WIN, "dw_fs", fname, math.max(7, fsize - 1), false)
+  local lh = WindowFontInfo(WIN, "dw_f", 1) + 1
+  local PAD = 8
+  local P = W.palette()
+  for id in pairs(W.added) do WindowDeleteHotspot(WIN, id) end
+  W.added = {}
+  win:blank()
+  local L, T, R, B = win.bodyleft, win.bodytop, win.bodyright, win.bodybottom
+  local function tw(font, s) return WindowTextWidth(WIN, font, s) end
+  local function tx(font, s, x, y, col) return WindowText(WIN, font, s, x, y, 0, 0, col, false) end
+  local function fitw(font, s, maxw)
+    if maxw <= 0 then return "" end
+    if tw(font, s) <= maxw then return s end
+    while #s > 1 and tw(font, s .. "...") > maxw do s = s:sub(1, -2) end
+    return s .. "..."
+  end
+  local function pill(x1, y1, x2, y2, fill, edge) WindowCircleOp(WIN, 3, x1, y1, x2, y2, edge or fill, 0, 1, fill, 0, 8, 8) end
+  local function hs(id, x1, y1, x2, y2, tip, wheel)
+    if WindowMoveHotspot(WIN, id, x1, y1, x2, y2) ~= 0 then
+      WindowAddHotspot(WIN, id, x1, y1, x2, y2, "", "", "", "", "DBG_click", tip or "", 1, 0)
+      if wheel then WindowScrollwheelHandler(WIN, id, "DBG_wheel") end
+    end
+    W.added[id] = true
+  end
+  local function box(x, y, size, ticked)
+    WindowRectOp(WIN, 2, x, y, x + size, y + size, ticked and P.idle or P.bg)
+    WindowRectOp(WIN, 1, x, y, x + size, y + size, P.edge)
+    if ticked then tx("dw_fs", "x", x + 3, y - 1, P.text) end
+  end
+  local names = W.list()
+  W.names = names
+  local np, nt = 0, 0
+  for _, n in ipairs(names) do if W.shown(n) then np = np + 1 end end
+  for _, k in ipairs(W.KINDS) do if W.kind_shown(k) then nt = nt + 1 end end
+
+  -- top bar: the on/off button and a one-line summary
+  local barH = lh + 12
+  local label = on and "Debugger ON" or "Debugger off"
+  local bw = tw("dw_fs", label) + 16
+  pill(L + PAD, T + 5, L + PAD + bw, T + 3 + lh + 4, P.panel, on and P.on or P.edge)
+  tx("dw_fs", label, L + PAD + 8, T + 7, on and P.on or P.muted)
+  hs("a_toggle", L + PAD, T + 5, L + PAD + bw, T + 3 + lh + 4, on and "Click to stop the debugger" or "Click to start the debugger")
+  local sx = L + PAD * 2 + bw
+  tx("dw_fs", fitw("dw_fs", "watching " .. np .. " of " .. #names .. " plugins, " .. nt .. " of " .. #W.KINDS .. " kinds of line", R - sx - PAD), sx, T + 7, P.muted)
+  WindowLine(WIN, L, T + barH, R, T + barH, P.edge, 0, 1)
+
+  -- geometry: plugins on the left, kinds of line on the right
+  local midX = L + math.floor((R - L + 1) * 0.58)
+  local hdrTop = T + barH + 1
+  local hdrH = lh + 10
+  local footH = lh + 10
+  local listTop, listBottom = hdrTop + hdrH + 1, B - footH
+  WindowLine(WIN, midX, T + barH, midX, listBottom, P.edge, 0, 1)
+  WindowLine(WIN, L, hdrTop + hdrH, R, hdrTop + hdrH, P.edge, 0, 1)
+  WindowLine(WIN, L, listBottom, R, listBottom, P.edge, 0, 1)
+  local function colhead(x1, x2, title, idAll, idNone)
+    local rx = x2 - PAD
+    for _, b in ipairs({ { idNone, "None", "Untick all, then tick the few you want" }, { idAll, "All", "Tick all" } }) do
+      local w = tw("dw_fs", b[2]) + 14
+      if rx - w > x1 + 60 then
+        pill(rx - w, hdrTop + 3, rx, hdrTop + hdrH - 4, P.panel, P.edge); tx("dw_fs", b[2], rx - w + 7, hdrTop + 5, P.text)
+        hs(b[1], rx - w, hdrTop + 3, rx, hdrTop + hdrH - 4, b[3])
+        rx = rx - w - 5
+      end
+    end
+    tx("dw_fb", fitw("dw_fb", title, rx - x1 - PAD), x1 + PAD, hdrTop + 5, P.text)
+  end
+  colhead(L, midX - 1, "Plugins", "p_all", "p_none")
+  colhead(midX + 1, R, "Kinds of line", "t_all", "t_none")
+
+  -- plugin list (scrolls)
+  local rowH = lh + 8
+  local visible = math.max(1, math.floor((listBottom - listTop) / rowH))
+  local maxTop = math.max(0, #names - visible)
+  if W.top > maxTop then W.top = maxTop end
+  if W.top < 0 then W.top = 0 end
+  local sbw = ok_sb and ((Theme.RESIZER_SIZE or 14)) or 0
+  local RR = midX - 1 - sbw - (sbw > 0 and 1 or 0)
+  for i = 1, visible do
+    local n = W.top + i
+    local name = names[n]
+    if not name then break end
+    local y1 = listTop + (i - 1) * rowH
+    local y2 = y1 + rowH - 1
+    local ticked = W.shown(name)
+    if ticked then WindowRectOp(WIN, 2, L, y1, RR, y2, P.sel) elseif i % 2 == 0 then WindowRectOp(WIN, 2, L, y1, RR, y2, P.panel) end
+    box(L + PAD, y1 + 4, lh - 4, ticked)
+    local x0 = L + PAD + lh + 4
+    local text, note = name, nil
+    if name == WORLD then note = "your own scripts and the world file"
+    elseif isStock(name) then note = "stock" end
+    local nameW = tw("dw_f", fitw("dw_f", text, RR - PAD - x0))
+    tx("dw_f", fitw("dw_f", text, RR - PAD - x0), x0, y1 + 4, ticked and P.text or P.muted)
+    if note and RR - PAD - (x0 + nameW + 8) > 20 then tx("dw_fs", fitw("dw_fs", note, RR - PAD - (x0 + nameW + 8)), x0 + nameW + 8, y1 + 5, P.muted) end
+    hs("p_row" .. n, L, y1, RR, y2, name == WORLD and "Lines that belong to no plugin: your world file's own triggers, aliases and scripts" or name, true)
+  end
+  hs("p_zlist", L, listTop, midX - 1, listBottom, "", true)       -- named to sort after the rows: hotspots are tried in name order
+  if ok_sb then
+    if not W.sb then
+      W.sb = ScrollBar.new(WIN, "pdbg", midX - sbw, listTop, midX - 1, listBottom)
+      W.sb:addUpdateCallback(nil, function(step) W.top = math.max(0, (tonumber(step) or 1) - 1); W.safedraw() end)
+    end
+    W.sb:setRect(midX - sbw, listTop, midX - 1, listBottom)
+    W.sb:setScroll(W.top + 1, visible, math.max(#names, visible), true)
+    W.sb:draw(true)
+  end
+
+  -- kinds of line
+  for i, k in ipairs(W.KINDS) do
+    local y1 = listTop + (i - 1) * rowH
+    local y2 = y1 + rowH - 1
+    if y2 > listBottom then break end
+    local ticked = W.kind_shown(k)
+    if ticked then WindowRectOp(WIN, 2, midX + 1, y1, R, y2, P.sel) elseif i % 2 == 0 then WindowRectOp(WIN, 2, midX + 1, y1, R, y2, P.panel) end
+    box(midX + 1 + PAD, y1 + 4, lh - 4, ticked)
+    local x0 = midX + 1 + PAD + lh + 4
+    local colour = ColourNameToRGB and ColourNameToRGB(TAG[k] or "silver") or P.text
+    local tag = "[" .. k .. "]"
+    tx("dw_f", tag, x0, y1 + 4, ticked and colour or P.muted)
+    local dx = x0 + tw("dw_f", tag) + 8
+    if R - PAD - dx > 20 then tx("dw_fs", fitw("dw_fs", W.DESC[k], R - PAD - dx), dx, y1 + 5, P.muted) end
+    hs("t_row" .. i, midX + 1, y1, R, y2, W.DESC[k], false)
+  end
+
+  -- footer
+  local msg = "Click a box to watch or skip it. None, then tick a few, shows just those."
+  if #itypes + #igroups + #ignore > 0 then msg = (ignoreText():gsub("^ignoring", "Also ignoring")) .. "  (dbg ignore clear removes them)" end
+  tx("dw_fs", fitw("dw_fs", msg, R - L - 2 * PAD), L + PAD, listBottom + 5, (#itypes + #igroups + #ignore > 0) and P.warn or P.muted)
+  win:dress_window("Plugin Debugger")
+end
+
+function W.safedraw()
+  local ok, err = pcall(W.draw)
+  if not ok and err ~= W.lastErr then W.lastErr = err; say("window draw error: " .. tostring(err)) end
+  W.repaint()
+end
+
+function W.open(force)
+  if not ok_theme then say("The window library is not available (it comes with the Aardwolf package). The text commands work: dbg help."); return end
+  if not (W.win and WindowInfo(WIN, 1)) then
+    W.added = {}
+    W.win = ThemedBasicWindow(WIN, 220, 150, 700, 420, "Plugin Debugger", "center", true, 1,
+      function() W.safedraw() end, function() W.safedraw(); DoAfterSpecial(0.1, "dbg_win_redraw()", 12) end,
+      function() W.win = nil; W.added = {}; if W.sb then pcall(W.sb.unInit, W.sb) end; W.sb = nil end,
+      GetAlphaOption("output_font_name"), GetOption("output_font_height"), true)
+    if type(W.win.menu_table) == "table" and type(W.win.menu_handlers) == "table" then       -- some versions of the library have no menu
+      table.insert(W.win.menu_table, "Close"); table.insert(W.win.menu_handlers, function() W.win:hide() end)
+    end
+  end
+  local show = force
+  if show == nil then show = not WindowInfo(WIN, 5) end
+  if show then
+    W.win:show(); W.safedraw()
+    for _, t in ipairs({ 0.1, 0.3, 1 }) do DoAfterSpecial(t, "dbg_win_redraw()", 12) end
+  else W.win:hide(); W.repaint() end
+end
+
+function dbg_win_redraw() if W.win and WindowInfo(WIN, 1) then W.safedraw() end end
+function DBG_wheel(flags)
+  W.top = W.top + ((bit.band(flags, 0x100) ~= 0) and 1 or -1)          -- 0x100 = scrolled down
+  if W.top < 0 then W.top = 0 end
+  W.safedraw()
+end
+function DBG_click(flags, id)
+  if bit.band(flags, miniwin.hotspot_got_lh_mouse) == 0 then return end
+  local changed = true
+  if id == "a_toggle" then dbg_command("", "", { on and "off" or "on" }); changed = false
+  elseif id == "p_all" then pick = nil; clear(watch); clear(groups)
+  elseif id == "p_none" then pick = {}; clear(watch); clear(groups)
+  elseif id == "t_all" then clear(types)
+  elseif id == "t_none" then clear(types); types[1] = "none"
+  else
+    local n = id:match("^p_row(%d+)$")
+    if n then
+      local name = W.names[tonumber(n)]
+      if name then W.toggle_plugin(name) end
+    else
+      n = id:match("^t_row(%d+)$")
+      if n and W.KINDS[tonumber(n)] then W.toggle_kind(W.KINDS[tonumber(n)]) else changed = false end
+    end
+  end
+  if changed then SaveState() end
+  W.safedraw()
+end
+
+function dbg_command(name, line, wildcards)
+  local arg = (wildcards[1] or ""):gsub("^%s+", ""):gsub("%s+$", "")
+  local cmd, rest = arg:match("^(%S+)%s*(.*)$")
+  cmd = cmd and cmd:lower() or ""
+  rest = rest or ""
+  local lr = rest:lower()
+  if cmd == "on" then if not on then startTrace() end return end
+  if cmd == "off" then if on then stopTrace() else say("already off.") end return end
+  if cmd == "watch" then
+    if rest ~= "" then
+      local words = {}
+      for w in lr:gmatch("%S+") do words[#words + 1] = w end
+      if words[1] == "clear" or (#words == 1 and words[1] == "all") then watch, types, groups, pick = {}, {}, {}, nil
+      else
+        for _, w in ipairs(words) do
+          if w ~= "all" then
+            local ty, gr = TYPE_WORDS[w], GROUP_WORDS[w]
+            if ty then
+              if types[1] == "none" then table.remove(types, 1) end
+              if not listHas(types, ty) then types[#types + 1] = ty end
+            elseif gr then if not listHas(groups, gr) then groups[#groups + 1] = gr end
+            elseif not listHas(watch, w) then watch[#watch + 1] = w end
+          end
+        end
+      end
+      SaveState()
+    end
+    say(watchText())
+    return
+  end
+  if cmd == "ignore" then
+    if lr == "clear" then
+      for i = #ignore, 1, -1 do ignore[i] = nil end
+      for i = #itypes, 1, -1 do itypes[i] = nil end
+      for i = #igroups, 1, -1 do igroups[i] = nil end
+    else
+      for w in lr:gmatch("%S+") do
+        local ty, gr = TYPE_WORDS[w], GROUP_WORDS[w]
+        if ty then if not listHas(itypes, ty) then itypes[#itypes + 1] = ty end
+        elseif gr then if not listHas(igroups, gr) then igroups[#igroups + 1] = gr end
+        else if not listHas(ignore, w) then ignore[#ignore + 1] = w end end
+      end
+    end
+    SaveState(); say(ignoreText()) return
+  end
+  if cmd == "unwatch" or cmd == "unignore" then
+    for w in lr:gmatch("%S+") do
+      local ty, gr = TYPE_WORDS[w], GROUP_WORDS[w]
+      local t = (cmd == "unwatch") and (ty and types or (gr and groups or watch)) or (ty and itypes or (gr and igroups or ignore))
+      local i = listHas(t, ty or gr or w); if i then table.remove(t, i) end
+    end
+    SaveState(); say(cmd == "unwatch" and watchText() or ignoreText()) return
+  end
+  if cmd == "noise" then
+    local any = false
+    for w in lr:gmatch("%S+") do
+      any = true
+      if w == "off" or w == "clear" then noiseOn = {}
+      elseif w == "all" then for _, n in ipairs(NOISE) do noiseOn[n] = true end
+      else
+        local hit
+        for _, n in ipairs(NOISE) do if n == w or n == "window" .. w then noiseOn[n] = true; hit = true end end
+        if not hit then say('"' .. w .. '" is not a noise word. They are: ' .. table.concat(NOISE, ", ")) end
+      end
+    end
+    local nz = {}
+    for _, n in ipairs(NOISE) do if noiseOn[n] then nz[#nz + 1] = n end end
+    say("Noise let through (until you change it or reload): " .. (#nz > 0 and table.concat(nz, ", ") or "none"))
+    return
+  end
+  if cmd == "stock" then
+    buildStock()
+    local names = {}
+    for n, v in pairs(stockCache) do if v then names[#names + 1] = n end end
+    table.sort(names)
+    say("stock plugins found (" .. #names .. ") = the ones the Aardwolf package's world file includes:")
+    plain(#names > 0 and table.concat(names, ", ") or "(none found)")
+    return
+  end
+  if cmd == "summary" then summary(tonumber(rest) or 10) return end
+  if cmd == "last" then
+    flushPend()
+    local n = tonumber(rest) or 30
+    for i = math.max(1, #ring - n + 1), #ring do
+      local ev = ring[i]; ColourNote(ev.kind == "sent" and "yellow" or "silver", "", os.date("%H:%M:%S ", ev.t) .. ev.s)
+    end
+    return
+  end
+  if cmd == "log" then
+    if lr == "on" or lr == "off" then logging = (lr == "on"); if not logging and logfile then logfile:close(); logfile = nil end; SaveState() end
+    say("log: " .. (logging and ("on, writing what is watched (" .. typesText() .. " in " .. whereText() .. ")") or "off")) return
+  end
+  if cmd == "quiet" then
+    if lr == "on" or lr == "off" then quiet = (lr == "on"); SaveState() end
+    say("quiet: " .. (quiet and "on" or "off")) return
+  end
+  if cmd == "window" or cmd == "win" or cmd == "select" or cmd == "pick" then DbgTest.W.open(); return end
+  if cmd == "help" or cmd == "?" then dbg_help(); return end
+  if cmd == "options" or cmd == "option" or cmd == "settings" or cmd == "status" then dbg_options(); return end
+  say("Plugin Debugger is " .. (on and "ON" or "off") .. ". Type  dbg options  to see the settings and  dbg help  for the commands.")
+end
+
+function OnPluginListChanged() stockCache = nil; if DbgTest.W.win then DoAfterSpecial(0.3, "dbg_win_redraw()", 12) end end
+function OnPluginInstall()
+  watch, ignore, types, itypes = loadList("watch"), loadList("ignore"), loadList("types"), loadList("itypes")
+  groups, igroups = loadList("groups"), loadList("igroups")
+  logging, quiet = GetVariable("logging") == "1", GetVariable("quiet") == "1"
+  pick = nil
+  if GetVariable("picked") == "1" then
+    pick = {}
+    for w in (GetVariable("pick") or ""):gmatch("[^\t]+") do pick[w] = true end
+  end
+end
+function OnPluginClose() if on then SetTrace(false) end; if logfile then logfile:close() end end
+]]>
+</script>
+</muclient>
